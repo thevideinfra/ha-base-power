@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -71,6 +72,9 @@ class BasePowerSensorEntityDescription(SensorEntityDescription):
     """
 
     value_fn: Callable[[dict[str, Any]], Any]
+    # Set for counters that reset on a schedule, so HA is told exactly when the
+    # reset happened rather than inferring one from a drop in value.
+    last_reset_fn: Callable[[dict[str, Any]], datetime | None] | None = None
 
 
 SENSORS: tuple[BasePowerSensorEntityDescription, ...] = (
@@ -145,9 +149,14 @@ SENSORS: tuple[BasePowerSensorEntityDescription, ...] = (
         name="Daily Total Energy",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        # TOTAL + last_reset, not TOTAL_INCREASING: this counter resets at
+        # local midnight, and letting HA infer that from a drop in value is
+        # what corrupted the Energy Dashboard totals (a dip smaller than 10%
+        # is recorded as a negative delta rather than a reset).
+        state_class=SensorStateClass.TOTAL,
         icon="mdi:sigma",
         value_fn=_from("derived", "daily_total_kwh"),
+        last_reset_fn=_from("derived", "day_start"),
     ),
     BasePowerSensorEntityDescription(
         key="intervals",
@@ -321,3 +330,10 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
         if not self.coordinator.data:
             return None
         return self.entity_description.value_fn(self.coordinator.data)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return when a scheduled-reset counter last reset."""
+        if not self.coordinator.data or self.entity_description.last_reset_fn is None:
+            return None
+        return self.entity_description.last_reset_fn(self.coordinator.data)

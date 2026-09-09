@@ -125,6 +125,11 @@ The following sensors use `state_class: total_increasing` and are ready to confi
 
 Full notes for recent releases live in [`docs/releases/`](docs/releases/).
 
+### v1.10.1
+- **Fix: Energy Dashboard grid total could go negative** — `MobileGetRecentUsage` returns a rolling 24-hour window, not today's intervals, so "Daily Total Energy" summed a window that slides rather than accumulates. Each poll that dropped a larger interval than it added made the value dip slightly, and Home Assistant records dips under 10% as negative deltas rather than meter resets. Over time the recorded grid total drifted downward and went negative. The daily figures are now computed from today's intervals only, and the sensor reports an explicit reset at local midnight instead of leaving Home Assistant to infer one
+- **Fix: Daily Peak, Daily Low and Intervals Today now mean today** — they previously covered the same rolling 24-hour window, which is why Intervals Today always read 96
+- Backup time estimate continues to use the full 24-hour window, where average household load is steadier than a partial day's
+
 ### v1.10.0
 - **Fix: API errors no longer look like empty data** — a rejected token, HTTP error, or gRPC failure previously returned an empty payload that parsed into zeros, so an expired session showed as a 0% battery indefinitely and reauthentication was never triggered. Failed calls now surface properly and a rejected token starts a reauth flow
 - **Fix: transient Clerk outages no longer force a re-login** — a 429/500/503 from Clerk raised an auth error, which logged you out and required a new emailed code. Only a genuine credential rejection (401/403) does that now; temporary failures simply retry on the next poll

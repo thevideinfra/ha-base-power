@@ -13,6 +13,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.util import dt as dt_util
 
 from .api import BasePowerApiClient
 from .auth import BasePowerAuth, AuthenticationError
@@ -205,17 +206,19 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Estimated backup hours: (SoC% × capacity_kWh) ÷ avg_home_power_kW
             battery_percent = derived.get("battery_percent")
-            intervals = derived.get("intervals_today", 0)
-            daily_total = derived.get("daily_total_kwh", 0.0)
+            # Use the full 24h window, not today-so-far: just after midnight
+            # a partial day is a poor estimate of average household load.
+            intervals = derived.get("window_intervals", 0)
+            window_total = derived.get("window_total_kwh", 0.0)
             capacity_kwh = derived.get("capacity_kwh", 0.0)
             if (
                 battery_percent is not None
                 and battery_percent > 0
                 and intervals > 0
-                and daily_total > 0
+                and window_total > 0
                 and capacity_kwh > 0
             ):
-                avg_power_kw = daily_total / (intervals / 4)
+                avg_power_kw = window_total / (intervals / 4)
                 battery_energy_kwh = battery_percent / 100 * capacity_kwh
                 derived["estimated_backup_hours"] = round(battery_energy_kwh / avg_power_kw, 1)
             else:
@@ -312,6 +315,19 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         battery_count = dashboard.get("battery_count", DEFAULT_BATTERY_COUNT)
         capacity_kwh = battery_count * BATTERY_CAPACITY_PER_UNIT_KWH
 
+        # MobileGetRecentUsage returns a ROLLING 24-hour window (96 x 15-min
+        # intervals), not "today". Summing the whole window gives a value that
+        # slides rather than accumulates: as each poll drops the oldest
+        # interval and adds a new one, the sum dips whenever the departing
+        # interval was larger. Reported through a TOTAL_INCREASING sensor those
+        # dips are recorded as negative deltas (HA only treats a drop as a
+        # meter reset below 90% of the previous value), which drove the Energy
+        # Dashboard's grid total negative. So the "daily" figures below are
+        # computed over today's intervals only, which really does accumulate
+        # and really does reset at midnight.
+        day_start = dt_util.start_of_local_day()
+        day_start_ts = day_start.timestamp()
+
         derived: dict[str, Any] = {
             "battery_percent": None,
             "battery_count": battery_count,
@@ -322,6 +338,13 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "daily_low_kwh": 0.0,
             "daily_total_kwh": 0.0,
             "intervals_today": 0,
+            # Exposed so the energy sensor can report an explicit last_reset
+            # instead of making HA infer resets from value drops.
+            "day_start": day_start,
+            # Whole-window figures: a 24h average is steadier than a partial
+            # day's, so the backup estimate keeps using these.
+            "window_total_kwh": 0.0,
+            "window_intervals": 0,
         }
 
         # Usage-derived values
@@ -332,9 +355,16 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             latest = max(usage, key=lambda p: p.get("timestamp", 0))
             derived["current_kwh"] = latest["kwh"]
             derived["current_power_watts"] = round(latest["kwh"] * 4000)
-            derived["daily_peak_kwh"] = max(values)
-            derived["daily_low_kwh"] = min(values)
-            derived["daily_total_kwh"] = round(sum(values), 2)
-            derived["intervals_today"] = len(values)
+            derived["window_total_kwh"] = round(sum(values), 2)
+            derived["window_intervals"] = len(values)
+
+            today = [
+                p["kwh"] for p in usage if p.get("timestamp", 0) >= day_start_ts
+            ]
+            if today:
+                derived["daily_peak_kwh"] = max(today)
+                derived["daily_low_kwh"] = min(today)
+                derived["daily_total_kwh"] = round(sum(today), 2)
+                derived["intervals_today"] = len(today)
 
         return derived
