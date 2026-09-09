@@ -2,15 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 import struct
 import logging
 from typing import Any
 
 import aiohttp
 
+from .auth import AuthenticationError
 from .const import API_HOST, API_SERVICE, API_CONTENT_TYPE
 
 _LOGGER = logging.getLogger(__name__)
+
+# The poll interval is 300s; don't let one hung request run into the next poll.
+_API_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# gRPC status code for "credentials rejected".
+_GRPC_UNAUTHENTICATED = "16"
+
+
+class ApiError(Exception):
+    """Raised when an API call fails.
+
+    Distinct from an empty-but-successful response: several of these RPCs
+    legitimately return a zero-length frame with grpc-status 0, and the
+    coordinator relies on being able to tell the two apart.
+    """
 
 
 def _build_grpc_frame(payload: bytes) -> bytes:
@@ -23,18 +40,38 @@ def _parse_grpc_frame(response: bytes) -> bytes:
     if len(response) < 5:
         return b""
     flag = response[0]
-    if flag == 0x80:  # Trailer only, no data
+    if flag & 0x80:  # Trailer frame (0x80), not data
         return b""
     length = struct.unpack(">I", response[1:5])[0]
     if length == 0:
         return b""
-    return response[5 : 5 + length]
+    frame = response[5 : 5 + length]
+    if len(frame) < length:
+        # Truncated/!gRPC body -- hand back what we have; the field parsers are
+        # tolerant, but say so, since this usually means a non-gRPC response.
+        _LOGGER.debug(
+            "gRPC frame claims %d bytes but only %d are present", length, len(frame)
+        )
+    return frame
+
+
+def _encode_varint(value: int) -> bytes:
+    """Encode an int as a protobuf varint."""
+    out = bytearray()
+    while True:
+        chunk = value & 0x7F
+        value >>= 7
+        out.append(chunk | 0x80 if value else chunk)
+        if not value:
+            return bytes(out)
 
 
 def _encode_service_location_request(service_location_id: str) -> bytes:
     """Encode a protobuf request with service_location_id as field 1 (string)."""
     encoded = service_location_id.encode("utf-8")
-    return b"\x0a" + bytes([len(encoded)]) + encoded
+    # Length is a varint, not a byte: a >=128 byte id would encode wrongly and
+    # a >=256 byte one would raise.
+    return b"\x0a" + _encode_varint(len(encoded)) + encoded
 
 
 def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
@@ -86,12 +123,10 @@ def _parse_grid_data_point(sub: bytes) -> tuple[int, float | None, float | None]
             length, offset = _decode_varint(sub, offset)
             inner = sub[offset:offset + length]
             offset += length
-            if field_num == 1:
-                # Timestamp sub-message: {field 1: varint}
-                _, ts_offset = _decode_varint(inner, 0)  # skip tag
-                ts, _ = _decode_varint(inner, 1)  # read varint after tag byte 0x08
-                if inner[0] == 0x08:
-                    ts, _ = _decode_varint(inner, 1)
+            if field_num == 1 and inner[:1] == b"\x08":
+                # Timestamp sub-message: {field 1: varint}. inner[:1] rather than
+                # inner[0] -- a zero-length sub-message would raise IndexError.
+                ts, _ = _decode_varint(inner, 1)
         elif wire_type == 5:
             if offset + 4 <= len(sub):
                 val = struct.unpack("<f", sub[offset:offset + 4])[0]
@@ -125,7 +160,7 @@ def _parse_usage_point(sub: bytes) -> tuple[int, float]:
             length, offset = _decode_varint(sub, offset)
             inner = sub[offset:offset + length]
             offset += length
-            if field_num == 1 and inner[0] == 0x08:
+            if field_num == 1 and inner[:1] == b"\x08":
                 ts, _ = _decode_varint(inner, 1)
         elif wire_type == 5:
             if offset + 4 <= len(sub):
@@ -205,7 +240,7 @@ def _parse_first_location_id(data: bytes) -> str | None:
                         if sub_field == 1:
                             try:
                                 return value.decode("utf-8")
-                            except Exception:
+                            except UnicodeDecodeError:
                                 return None
                     else:
                         sub_offset = _skip_field(sub, sub_offset, sub_wire)
@@ -218,7 +253,7 @@ def _parse_first_location_id(data: bytes) -> str | None:
 def _parse_billing_submessage(sub: bytes, result: dict[str, Any]) -> None:
     """Parse a nested billing sub-message for amount_cents / due_date.
 
-    FIX (see BILLING_PARSER_BUG.md): live captures show MobileGetBillingMetadata
+    FIX: live captures show MobileGetBillingMetadata
     wraps its real payload inside a field-1 sub-message instead of exposing
     amount_cents/due_date as flat top-level fields. Confirmed sample:
         0a0a 080210a5930118b0880212020802
@@ -232,12 +267,12 @@ def _parse_billing_submessage(sub: bytes, result: dict[str, Any]) -> None:
     """
     offset = 0
     while offset < len(sub):
-        if offset >= len(sub):
+        tag_val, new_offset = _decode_varint(sub, offset)
+        if new_offset == offset:
             break
-        tag = sub[offset]
-        field_num = tag >> 3
-        wire_type = tag & 0x07
-        offset += 1
+        offset = new_offset
+        field_num = tag_val >> 3
+        wire_type = tag_val & 0x07
 
         if wire_type == 0:  # varint
             val, offset = _decode_varint(sub, offset)
@@ -286,7 +321,8 @@ class BasePowerApiClient:
         }
         try:
             async with session.post(
-                url, headers=headers, data=_build_grpc_frame(b"")
+                url, headers=headers, data=_build_grpc_frame(b""),
+                timeout=_API_TIMEOUT,
             ) as resp:
                 grpc_status = resp.headers.get("grpc-status", "")
                 if grpc_status and grpc_status != "0":
@@ -302,7 +338,17 @@ class BasePowerApiClient:
             return None
 
     async def _call(self, method: str, payload: bytes = b"") -> bytes:
-        """Make a gRPC-Web API call."""
+        """Make a gRPC-Web API call.
+
+        Returns the decoded protobuf payload, which may legitimately be empty
+        (grpc-status 0 with a zero-length frame) for accounts that don't have a
+        given data stream. Anything that is actually a *failure* raises, so the
+        coordinator can tell "no data" from "call didn't work" -- otherwise a
+        rejected token reads downstream as a battery sitting at 0%.
+        """
+        if not self._jwt:
+            raise ApiError("No JWT available for API call")
+
         url = f"{API_HOST}/{API_SERVICE}/{method}"
         headers = {
             "Content-Type": API_CONTENT_TYPE,
@@ -311,26 +357,39 @@ class BasePowerApiClient:
         }
         body = _build_grpc_frame(payload)
 
-        async with self._session.post(url, headers=headers, data=body) as resp:
-            response_data = await resp.read()
-            grpc_status = resp.headers.get("grpc-status", "")
-            if grpc_status and grpc_status != "0":
-                grpc_message = resp.headers.get("grpc-message", "unknown")
-                _LOGGER.error(
-                    "gRPC error calling %s: status=%s message=%s",
-                    method,
-                    grpc_status,
-                    grpc_message,
-                )
-                return b""
-            data = _parse_grpc_frame(response_data)
-            if not data:
-                _LOGGER.debug(
-                    "%s returned an empty payload (grpc-status=%s) -- this account/"
-                    "hardware may not have this data stream available",
-                    method, grpc_status or "0",
-                )
-            return data
+        try:
+            async with self._session.post(
+                url, headers=headers, data=body, timeout=_API_TIMEOUT
+            ) as resp:
+                response_data = await resp.read()
+                grpc_status = resp.headers.get("grpc-status", "")
+
+                if resp.status in (401, 403):
+                    raise AuthenticationError(
+                        f"{method} rejected our token: HTTP {resp.status}"
+                    )
+                if resp.status != 200:
+                    # Not a gRPC response at all (proxy/edge error). Don't feed
+                    # an HTML error page to the protobuf parsers.
+                    raise ApiError(f"{method} returned HTTP {resp.status}")
+                if grpc_status == _GRPC_UNAUTHENTICATED:
+                    raise AuthenticationError(f"{method} returned UNAUTHENTICATED")
+                if grpc_status and grpc_status != "0":
+                    raise ApiError(
+                        f"{method} returned grpc-status={grpc_status} "
+                        f"({resp.headers.get('grpc-message', 'unknown')})"
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise ApiError(f"{method} request failed: {err}") from err
+
+        data = _parse_grpc_frame(response_data)
+        if not data:
+            _LOGGER.debug(
+                "%s returned an empty payload (grpc-status=%s) -- this account/"
+                "hardware may not have this data stream available",
+                method, grpc_status or "0",
+            )
+        return data
 
     async def get_dashboard_root(self, service_location_id: str) -> dict[str, Any]:
         """Get dashboard root data including backup hours and status."""
@@ -555,7 +614,7 @@ class BasePowerApiClient:
                             if sfn == 1:
                                 try:
                                     ssid = val.decode("utf-8")
-                                except Exception:
+                                except UnicodeDecodeError:
                                     pass
                         elif swt == 0:
                             ival, off = _decode_varint(sub, off)
@@ -580,19 +639,30 @@ class BasePowerApiClient:
         if not data:
             return result
 
+        # Walk fields properly rather than scanning for a 0x12 byte: that byte
+        # occurs just as happily inside a nested entry or a float, and the old
+        # scan could also run off the end of the buffer.
         offset = 0
         while offset < len(data):
-            if data[offset] == 0x12:  # field 2 (asset_id string)
-                str_len = data[offset + 1]
-                result["asset_id"] = data[offset + 2 : offset + 2 + str_len].decode(
-                    "utf-8"
-                )
+            tag_val, new_offset = _decode_varint(data, offset)
+            if new_offset == offset:
                 break
-            elif data[offset] == 0x0A:  # field 1 (cycle entry), skip it
-                entry_len = data[offset + 1]
-                offset += 2 + entry_len
+            offset = new_offset
+            field_num = tag_val >> 3
+            wire_type = tag_val & 0x07
+
+            if wire_type == 2:
+                length, offset = _decode_varint(data, offset)
+                payload = data[offset : offset + length]
+                offset += length
+                if field_num == 2 and payload:  # asset_id (string)
+                    try:
+                        result["asset_id"] = payload.decode("utf-8")
+                    except UnicodeDecodeError:
+                        _LOGGER.debug("UsageCycles asset_id was not valid UTF-8")
+                    break
             else:
-                offset += 1
+                offset = _skip_field(data, offset, wire_type)
 
         return result
 
@@ -614,6 +684,9 @@ class BasePowerApiClient:
             "battery_remaining_seconds": 0,
             "current_power_amps": None,
             "hourly_usage": [],
+            # Timestamp of the newest telemetry sample. Lets the coordinator
+            # tell "no new sample yet" from "new sample, unchanged value".
+            "soc_timestamp": None,
         }
         if not data:
             return result
@@ -680,6 +753,8 @@ class BasePowerApiClient:
                 break
 
         # Use latest time-series SoC if found
+        if latest_ts:
+            result["soc_timestamp"] = latest_ts
         if latest_soc is not None:
             result["battery_soc_percent"] = round(latest_soc, 1)
         if latest_power is not None:
@@ -705,8 +780,7 @@ class BasePowerApiClient:
           Field 3: battery_to_home_kwh
 
         NOTE: as of this patch we have not captured a non-empty payload for this
-        RPC on a real account (see BILLING_PARSER_BUG.md / the upstream issue this
-        patch accompanies) -- MobileGetUsageEnergy returned a genuinely empty
+        RPC on a real account -- MobileGetUsageEnergy returned a genuinely empty
         gRPC-Web frame (grpc-status 0, zero-length message) on every poll observed.
         The flat-field parsing below is left as-is since we have no evidence it is
         wrong, only evidence that it's never been exercised against real data. If
@@ -724,12 +798,12 @@ class BasePowerApiClient:
 
         offset = 0
         while offset < len(data):
-            if offset >= len(data):
+            tag_val, new_offset = _decode_varint(data, offset)
+            if new_offset == offset:
                 break
-            tag = data[offset]
-            field_num = tag >> 3
-            wire_type = tag & 0x07
-            offset += 1
+            offset = new_offset
+            field_num = tag_val >> 3
+            wire_type = tag_val & 0x07
 
             if wire_type == 5:  # 32-bit (float)
                 if offset + 4 <= len(data):
@@ -775,12 +849,12 @@ class BasePowerApiClient:
 
         offset = 0
         while offset < len(data):
-            if offset >= len(data):
+            tag_val, new_offset = _decode_varint(data, offset)
+            if new_offset == offset:
                 break
-            tag = data[offset]
-            field_num = tag >> 3
-            wire_type = tag & 0x07
-            offset += 1
+            offset = new_offset
+            field_num = tag_val >> 3
+            wire_type = tag_val & 0x07
 
             if wire_type == 0:  # varint
                 val, offset = _decode_varint(data, offset)

@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
@@ -24,6 +24,7 @@ from .const import (
     CONF_SERVICE_LOCATION_ID,
     CONF_WIFI_SSID,
     CONF_BATTERY_COUNT,
+    DEFAULT_BATTERY_COUNT,
 )
 from .api import BasePowerApiClient
 from .auth import BasePowerAuth, AuthenticationError
@@ -44,7 +45,9 @@ class BasePowerOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(data=user_input)
 
         current_ssid = self.config_entry.options.get(CONF_WIFI_SSID, "")
-        current_count = self.config_entry.options.get(CONF_BATTERY_COUNT, 1)
+        current_count = self.config_entry.options.get(
+            CONF_BATTERY_COUNT, DEFAULT_BATTERY_COUNT
+        )
 
         # Pull live WiFi scan from the running coordinator (no extra API call needed)
         scan: dict[str, int | None] = {}
@@ -114,16 +117,27 @@ class BasePowerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._email = user_input[CONF_EMAIL]
 
             try:
-                async with aiohttp.ClientSession() as session:
+                async with async_create_clientsession(self.hass) as session:
                     result = await BasePowerAuth.async_initiate_sign_in(
                         session, self._email, CLERK_PUBLISHABLE_KEY
                     )
-                    self._sign_in_id = result["sign_in_id"]
-                    self._email_id = result["email_id"]
+                    self._sign_in_id = result["sign_in_id"] or ""
+                    self._email_id = result["email_id"] or ""
                     self._client_token = result["client_token"]
 
+                    # Any of these missing means Clerk's response wasn't the
+                    # shape we expect (or the account has no email_code
+                    # factor). Stop here rather than interpolating "None" into
+                    # the next request's URL and body.
                     if not self._client_token:
                         _LOGGER.error("No client token received from Clerk")
+                        errors["base"] = "auth_failed"
+                    elif not self._sign_in_id or not self._email_id:
+                        _LOGGER.error(
+                            "Clerk did not return an email sign-in factor "
+                            "(sign_in_id=%s, email_id=%s)",
+                            bool(self._sign_in_id), bool(self._email_id),
+                        )
                         errors["base"] = "auth_failed"
                     else:
                         # Send OTP code (token may rotate)
@@ -144,7 +158,9 @@ class BasePowerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_EMAIL): str}),
+            data_schema=vol.Schema(
+                {vol.Required(CONF_EMAIL, default=self._email or vol.UNDEFINED): str}
+            ),
             errors=errors,
         )
 
@@ -158,16 +174,23 @@ class BasePowerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             code = user_input["code"]
 
             try:
-                async with aiohttp.ClientSession() as session:
+                async with async_create_clientsession(self.hass) as session:
                     result = await BasePowerAuth.async_attempt_first_factor(
                         session,
                         self._sign_in_id,
                         code,
                         self._client_token,
                     )
-                    self._session_id = result["session_id"]
+                    self._session_id = result["session_id"] or ""
                     self._client_token = result["client_token"]
                     self._session_jwt = result.get("session_jwt")
+
+                    if not self._session_id:
+                        # Without a session id every future token refresh would
+                        # request /sessions//tokens and fail after setup.
+                        _LOGGER.error("Clerk returned no active session")
+                        errors["base"] = "auth_failed"
+                        return self._show_code_form(errors)
 
                     # During reauth, location ID is already known — skip discovery
                     if self._service_location_id:
@@ -207,6 +230,12 @@ class BasePowerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error during verification")
                 errors["base"] = "unknown"
 
+        return self._show_code_form(errors)
+
+    def _show_code_form(
+        self, errors: dict[str, str]
+    ) -> config_entries.ConfigFlowResult:
+        """Render the OTP entry form."""
         return self.async_show_form(
             step_id="verify_code",
             data_schema=vol.Schema({vol.Required("code"): str}),

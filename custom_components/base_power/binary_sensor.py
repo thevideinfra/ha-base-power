@@ -2,17 +2,105 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
+    BinarySensorEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, CONF_SERVICE_LOCATION_ID
+from .const import DOMAIN, CONF_SERVICE_LOCATION_ID, MANUFACTURER, MODEL
 from .coordinator import BasePowerCoordinator
+
+
+def _has_solar(data: dict[str, Any]) -> bool | None:
+    """Return True if the system reports solar."""
+    return data.get("dashboard", {}).get("has_solar", False)
+
+
+def _battery_connected(data: dict[str, Any]) -> bool | None:
+    """Return True if the battery appears to be online.
+
+    Prefer the WiFi telemetry, which is what actually reflects connectivity:
+    the coordinator sets wifi["connected"] from whether the battery returned a
+    scan this cycle. Fall back to the old backup_seconds heuristic only when we
+    have no WiFi telemetry at all, since MobileGetWifiMetrics returns nothing
+    on some accounts and a hard switch would pin this sensor to "disconnected"
+    forever there.
+
+    (backup_seconds > 0 is a poor connectivity signal on its own: a fully
+    discharged but perfectly online battery reads as disconnected.)
+    """
+    wifi = data.get("wifi", {})
+    if wifi.get("ssid") is not None:
+        return bool(wifi.get("connected", False))
+    return data.get("dashboard", {}).get("backup_seconds", 0) > 0
+
+
+def _grid_is_up(data: dict[str, Any]) -> bool | None:
+    """Return True if grid power is available (no outage).
+
+    Only reports a value when GridStatus actually returned data this cycle.
+    This used to default to True whenever the RPC returned no telemetry, which
+    is the wrong failure mode for outage detection: a real outage coinciding
+    with a failed telemetry call would show a false "on". Unknown is honest.
+    """
+    grid = data.get("grid", {})
+    if not grid.get("available", False):
+        return None
+    return grid.get("grid_is_up", True)
+
+
+@dataclass(frozen=True, kw_only=True)
+class BasePowerBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Describes a Base Power binary sensor.
+
+    `key` is also the unique_id suffix, so it must not change for an existing
+    sensor -- doing so orphans the entity and loses its history.
+    """
+
+    value_fn: Callable[[dict[str, Any]], bool | None]
+
+
+BINARY_SENSORS: tuple[BasePowerBinarySensorEntityDescription, ...] = (
+    BasePowerBinarySensorEntityDescription(
+        key="has_solar",
+        name="Solar Connected",
+        device_class=BinarySensorDeviceClass.POWER,
+        icon="mdi:solar-power",
+        value_fn=_has_solar,
+    ),
+    BasePowerBinarySensorEntityDescription(
+        key="battery_connected",
+        name="Battery Connected",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        icon="mdi:wifi",
+        value_fn=_battery_connected,
+    ),
+    BasePowerBinarySensorEntityDescription(
+        key="grid_power",
+        # Named "Grid Status" to avoid colliding with the "Grid Power" amps
+        # sensor; the key stays grid_power so existing entities are preserved.
+        name="Grid Status",
+        device_class=BinarySensorDeviceClass.POWER,
+        icon="mdi:transmission-tower",
+        value_fn=_grid_is_up,
+    ),
+    BasePowerBinarySensorEntityDescription(
+        key="battery_charging",
+        name="Battery Charging",
+        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        icon="mdi:battery-charging",
+        value_fn=lambda data: data.get("derived", {}).get("battery_charging"),
+    ),
+)
 
 
 async def async_setup_entry(
@@ -22,132 +110,42 @@ async def async_setup_entry(
 ) -> None:
     """Set up Base Power binary sensors from a config entry."""
     coordinator: BasePowerCoordinator = hass.data[DOMAIN][entry.entry_id]
-
-    entities = [
-        BasePowerSolarSensor(coordinator, entry),
-        BasePowerBatteryConnectedSensor(coordinator, entry),
-        BasePowerGridStatusSensor(coordinator, entry),
-        BasePowerBatteryChargingSensor(coordinator, entry),
-    ]
-
-    async_add_entities(entities)
+    async_add_entities(
+        BasePowerBinarySensor(coordinator, entry, description)
+        for description in BINARY_SENSORS
+    )
 
 
-class BasePowerBinarySensorBase(
+class BasePowerBinarySensor(
     CoordinatorEntity[BasePowerCoordinator], BinarySensorEntity
 ):
-    """Base class for Base Power binary sensors."""
+    """A Base Power binary sensor, described by an entity description."""
 
     _attr_has_entity_name = True
+    entity_description: BasePowerBinarySensorEntityDescription
 
     def __init__(
         self,
         coordinator: BasePowerCoordinator,
         entry: ConfigEntry,
+        description: BasePowerBinarySensorEntityDescription,
     ) -> None:
         """Initialize binary sensor."""
         super().__init__(coordinator)
+        self.entity_description = description
         self._entry = entry
+        service_location_id = entry.data[CONF_SERVICE_LOCATION_ID]
+        self._attr_unique_id = f"{service_location_id}_{description.key}"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.data[CONF_SERVICE_LOCATION_ID])},
-            "name": f"Base Power {entry.data[CONF_SERVICE_LOCATION_ID]}",
-            "manufacturer": "Base Power",
-            "model": "Home Battery System",
+            "identifiers": {(DOMAIN, service_location_id)},
+            "name": f"{MANUFACTURER} {service_location_id}",
+            "manufacturer": MANUFACTURER,
+            "model": MODEL,
         }
 
-
-class BasePowerSolarSensor(BasePowerBinarySensorBase):
-    """Binary sensor for solar panel presence."""
-
-    _attr_name = "Solar Connected"
-    _attr_device_class = BinarySensorDeviceClass.POWER
-    _attr_icon = "mdi:solar-power"
-
-    def __init__(self, coordinator: BasePowerCoordinator, entry: ConfigEntry) -> None:
-        """Initialize."""
-        super().__init__(coordinator, entry)
-        self._attr_unique_id = f"{entry.data[CONF_SERVICE_LOCATION_ID]}_has_solar"
-
     @property
     def is_on(self) -> bool | None:
-        """Return True if solar is connected."""
-        if self.coordinator.data:
-            return self.coordinator.data["dashboard"].get("has_solar", False)
-        return None
-
-
-
-
-class BasePowerBatteryConnectedSensor(BasePowerBinarySensorBase):
-    """Binary sensor for battery WiFi connectivity."""
-
-    _attr_name = "Battery Connected"
-    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
-    _attr_icon = "mdi:wifi"
-
-    def __init__(self, coordinator: BasePowerCoordinator, entry: ConfigEntry) -> None:
-        """Initialize."""
-        super().__init__(coordinator, entry)
-        self._attr_unique_id = f"{entry.data[CONF_SERVICE_LOCATION_ID]}_battery_connected"
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return True if battery is connected via WiFi."""
-        if self.coordinator.data:
-            # If we have dashboard data with backup_seconds > 0, battery is connected
-            return self.coordinator.data["dashboard"].get("backup_seconds", 0) > 0
-        return None
-
-
-class BasePowerGridStatusSensor(BasePowerBinarySensorBase):
-    """Binary sensor for grid power status (on = grid up, off = outage)."""
-
-    _attr_name = "Grid Power"
-    _attr_device_class = BinarySensorDeviceClass.POWER
-    _attr_icon = "mdi:transmission-tower"
-
-    def __init__(self, coordinator: BasePowerCoordinator, entry: ConfigEntry) -> None:
-        """Initialize."""
-        super().__init__(coordinator, entry)
-        self._attr_unique_id = f"{entry.data[CONF_SERVICE_LOCATION_ID]}_grid_power"
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return True if grid power is available (no outage).
-
-        FIX: this used to default to True (`.get("grid_is_up", True)`) whenever
-        the GridStatus RPC returned no telemetry at all -- which, on this
-        integration's own account testing, happens routinely (see
-        BILLING_PARSER_BUG.md / upstream issue). For an outage-detection sensor,
-        silently asserting "grid is fine" when we actually have no data is the
-        wrong failure mode: if a real outage coincides with the telemetry call
-        failing, users would see a false "on". Now we only report a value when
-        GridStatus actually returned data this cycle; otherwise we report
-        unknown (None) rather than guessing.
-        """
-        if self.coordinator.data:
-            grid = self.coordinator.data.get("grid", {})
-            if not grid.get("available", False):
-                return None
-            return grid.get("grid_is_up", True)
-        return None
-
-
-class BasePowerBatteryChargingSensor(BasePowerBinarySensorBase):
-    """Binary sensor for battery charging state (on = charging, off = discharging)."""
-
-    _attr_name = "Battery Charging"
-    _attr_device_class = BinarySensorDeviceClass.BATTERY_CHARGING
-    _attr_icon = "mdi:battery-charging"
-
-    def __init__(self, coordinator: BasePowerCoordinator, entry: ConfigEntry) -> None:
-        """Initialize."""
-        super().__init__(coordinator, entry)
-        self._attr_unique_id = f"{entry.data[CONF_SERVICE_LOCATION_ID]}_battery_charging"
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return True if battery SoC is increasing, False if decreasing, None if stable."""
-        if self.coordinator.data:
-            return self.coordinator.data.get("derived", {}).get("battery_charging")
-        return None
+        """Return the binary sensor state."""
+        if not self.coordinator.data:
+            return None
+        return self.entity_description.value_fn(self.coordinator.data)

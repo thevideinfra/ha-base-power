@@ -5,7 +5,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=flat-square)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/github/license/jerrit/ha-base-power?style=flat-square)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/jerrit/ha-base-power?style=flat-square)](https://github.com/jerrit/ha-base-power/stargazers)
-[![HA Version](https://img.shields.io/badge/HA-2024.1%2B-blue?style=flat-square&logo=home-assistant)](https://www.home-assistant.io/)
+[![HA Version](https://img.shields.io/badge/HA-2024.11%2B-blue?style=flat-square&logo=home-assistant)](https://www.home-assistant.io/)
 
 Unofficial Home Assistant integration for [Base Power](https://basepowercompany.com/) home battery systems. This project is not affiliated with or endorsed by Base Power.
 
@@ -122,6 +122,23 @@ The following sensors use `state_class: total_increasing` and are ready to confi
 - **Service Location ID**: Auto-discovered via `MobileGetAvailableLocations` — not required during setup
 
 ## Changelog
+
+### v1.10.0
+- **Fix: API errors no longer look like empty data** — a rejected token, HTTP error, or gRPC failure previously returned an empty payload that parsed into zeros, so an expired session showed as a 0% battery indefinitely and reauthentication was never triggered. Failed calls now surface properly and a rejected token starts a reauth flow
+- **Fix: transient Clerk outages no longer force a re-login** — a 429/500/503 from Clerk raised an auth error, which logged you out and required a new emailed code. Only a genuine credential rejection (401/403) does that now; temporary failures simply retry on the next poll
+- **Fix: Battery Connected now reports connectivity** — it was derived from remaining charge, so a drained but perfectly online battery read as disconnected, and an offline one read as connected
+- **Fix: Battery Charging no longer flaps to "unknown"** — SoC telemetry updates every 15 minutes but polling is every 5, so most polls saw no change and reported unknown. Slow charging (under 0.5%/sample) was never detected at all. Both fixed by tracking the telemetry sample timestamp
+- **Fix: Current Power picks the newest interval by timestamp** instead of assuming the API returns them in order
+- **Fix: leaked connection on failed setup** — a failed first refresh left an unclosed session behind on every retry
+- **Fix: crash on empty protobuf sub-messages** that could silently drop battery SoC, grid power and hourly usage for a poll
+- **Fix: protobuf fields numbered 16 and above** were misread in the billing and energy parsers
+- **Fix: correct minimum Home Assistant version** — the integration requires 2024.11 but claimed 2024.1, where it fails to load
+- Grid outage binary sensor renamed to **Grid Status** so it no longer shares a display name with the Grid Power sensor
+- WiFi Network selector moved to the device's configuration section
+- Request timeouts added throughout so a hung call can't stall a poll cycle
+- Sensor and binary sensor platforms rebuilt on entity descriptions (all entity IDs and history preserved)
+- Debug logging no longer includes account metadata or full authentication error bodies
+- `test_battery_count.py` moved to `scripts/probe_api.py`: the search term is now a command-line argument instead of a hardcoded SSID, saved credentials are written user-only, and resuming with an emailed code no longer starts a second sign-in
 
 ### v1.9.0
 - Add **WiFi Network select entity** — a dropdown on the Base Power device card lets you choose a preferred WiFi network directly from Home Assistant, with available networks populated from a live scan sorted by signal strength

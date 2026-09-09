@@ -1,5 +1,7 @@
 """Constants for the Base Power integration."""
 
+from homeassistant.const import Platform
+
 DOMAIN = "base_power"
 
 # API
@@ -13,7 +15,6 @@ CLERK_JS_VERSION = "5"
 
 # Polling intervals (seconds)
 SCAN_INTERVAL_SECONDS = 300  # 5 minutes
-GRID_SCAN_INTERVAL_SECONDS = 60  # 1 minute
 
 # Battery
 BATTERY_CAPACITY_PER_UNIT_KWH = 25  # Each Base Power battery is 25 kWh
@@ -28,5 +29,13 @@ CONF_EMAIL = "email"
 CONF_WIFI_SSID = "wifi_ssid"
 CONF_BATTERY_COUNT = "battery_count_override"
 
+# Device identity (shared by all platforms)
+MANUFACTURER = "Base Power"
+MODEL = "Home Battery System"
+
 # Platforms
-PLATFORMS = ["sensor", "binary_sensor", "select"]
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SELECT,
+]

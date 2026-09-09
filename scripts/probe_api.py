@@ -1,8 +1,16 @@
 """
 Probe Base Power API endpoints and dump full protobuf structures.
 
+This is a reverse-engineering tool, not a test suite -- it has no assertions.
+It signs in as you and dumps raw responses so a human can work out where a
+given value lives.
+
 Usage:
-  python3 test_battery_count.py <email>
+  python3 scripts/probe_api.py <email>                     # sends an OTP email
+  python3 scripts/probe_api.py <email> <code> [ssid]       # resumes with the code
+
+  <ssid>  optional string to search for across all probed endpoints, e.g. the
+          SSID your battery is joined to. Omit to skip the broad scan.
 
 Probes:
   - MobileGetAvailableLocations  (may contain unit count in location record)
@@ -10,12 +18,19 @@ Probes:
   - MobileGetGridStatus          (may have per-unit data)
   - MobileGetUsageCycles         (asset_id may encode unit info)
 
-Each response is fully dumped — all fields recursively — so we can spot
+Each response is fully dumped -- all fields recursively -- so we can spot
 where the battery unit count lives without guessing.
+
+*** The output can contain personal data: service address, account ids, SSIDs
+*** and billing figures. Review it before pasting into a bug report.
 """
 import asyncio
+import json
+import os
 import struct
 import sys
+import tempfile
+
 import aiohttp
 
 CLERK_DOMAIN = "https://clerk.basepowercompany.com"
@@ -127,16 +142,29 @@ def parse_grpc_frame(raw: bytes) -> bytes:
     if len(raw) < 5:
         return b""
     flag = raw[0]
-    if flag == 0x80:
+    if flag & 0x80:  # trailer frame, not data
         return b""
     length = struct.unpack(">I", raw[1:5])[0]
-    return raw[5 : 5 + length]
+    frame = raw[5 : 5 + length]
+    if len(frame) < length:
+        print(f"  (warning: frame claims {length} bytes, got {len(frame)})")
+    return frame
+
+
+def encode_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        chunk = value & 0x7F
+        value >>= 7
+        out.append(chunk | 0x80 if value else chunk)
+        if not value:
+            return bytes(out)
 
 
 def encode_string_field(field_num: int, value: str) -> bytes:
     encoded = value.encode("utf-8")
-    tag = (field_num << 3) | 2
-    return bytes([tag, len(encoded)]) + encoded
+    # Length is a varint: a one-byte prefix breaks at >=128 bytes.
+    return encode_varint((field_num << 3) | 2) + encode_varint(len(encoded)) + encoded
 
 
 async def call_endpoint(
@@ -177,43 +205,68 @@ async def probe_endpoint(
     return data
 
 
-async def auth_and_fetch(email: str, otp_code: str | None = None) -> None:
+# Holds a live Clerk client token between the two runs, so keep it private.
+STATE_FILE = os.path.join(tempfile.gettempdir(), "bp_auth_state.json")
+
+
+def save_state(state: dict) -> None:
+    """Write the resume state readable only by the current user."""
+    fd = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
+
+
+async def auth_and_fetch(
+    email: str, otp_code: str | None = None, scan_target: str | None = None
+) -> None:
     async with aiohttp.ClientSession() as session:
         # --- Authentication (mirrors production auth.py exactly) ---
         print(f"=== Authenticating {email} ===")
 
-        # Step 1: Initiate sign-in
-        url = f"{CLERK_DOMAIN}/v1/client/sign_ins?{_NATIVE}"
-        async with session.post(
-            url,
-            headers={**_HEADERS, "Authorization": f"Bearer {PUBLISHABLE_KEY}"},
-            data={"identifier": email},
-        ) as resp:
-            if resp.status != 200:
-                print(f"Sign-in init failed: {resp.status} {await resp.text()}")
-                return
-            client_token = resp.headers.get("Authorization", "")
-            body = await resp.json()
-
-        sign_in_id = body["response"]["id"]
-        email_id = None
-        for f in body["response"].get("supported_first_factors", []):
-            if f.get("strategy") == "email_code":
-                email_id = f.get("email_address_id")
-                break
-
-        import json, os
-        STATE_FILE = "/tmp/bp_auth_state.json"
-
-        # If a code was passed on CLI and we have saved state, skip straight to verify
         if otp_code and os.path.exists(STATE_FILE):
+            # Resume: reuse the pending sign-in. Starting a new one here would
+            # invalidate the attempt the emailed code belongs to.
             with open(STATE_FILE) as f:
                 state = json.load(f)
             sign_in_id = state["sign_in_id"]
             client_token = state["client_token"]
-            print(f"Resuming sign-in {sign_in_id} with provided OTP code.")
             os.remove(STATE_FILE)
+            print(f"Resuming sign-in {sign_in_id} with provided OTP code.")
         else:
+            if otp_code:
+                print(
+                    "A code was given but there is no pending sign-in "
+                    f"({STATE_FILE} is missing). Starting over; a new code "
+                    "will be emailed."
+                )
+
+            # Step 1: Initiate sign-in
+            url = f"{CLERK_DOMAIN}/v1/client/sign_ins?{_NATIVE}"
+            async with session.post(
+                url,
+                headers={**_HEADERS, "Authorization": f"Bearer {PUBLISHABLE_KEY}"},
+                data={"identifier": email},
+            ) as resp:
+                if resp.status != 200:
+                    print(f"Sign-in init failed: {resp.status} {await resp.text()}")
+                    return
+                client_token = resp.headers.get("Authorization", "")
+                body = await resp.json()
+
+            response = body.get("response") or {}
+            sign_in_id = response.get("id")
+            email_id = None
+            for f in response.get("supported_first_factors") or []:
+                if f.get("strategy") == "email_code":
+                    email_id = f.get("email_address_id")
+                    break
+            if not sign_in_id or not email_id:
+                print(
+                    "Clerk did not return an email sign-in factor "
+                    f"(sign_in_id={sign_in_id!r}, email_id={email_id!r})"
+                )
+                return
+
             # Step 2: Send OTP
             print("Sending OTP email...")
             otp_url = f"{CLERK_DOMAIN}/v1/client/sign_ins/{sign_in_id}/prepare_first_factor?{_NATIVE}"
@@ -227,9 +280,8 @@ async def auth_and_fetch(email: str, otp_code: str | None = None) -> None:
                     return
                 client_token = resp2.headers.get("Authorization", client_token)
                 print("  OTP sent — re-run with the code as a second argument:")
-                print(f"  python3 test_battery_count.py {email} <code>")
-                with open(STATE_FILE, "w") as f:
-                    json.dump({"sign_in_id": sign_in_id, "client_token": client_token}, f)
+                print(f"  python3 scripts/probe_api.py {email} <code> [ssid]")
+                save_state({"sign_in_id": sign_in_id, "client_token": client_token})
                 return
 
         # Step 3: Verify OTP
@@ -246,14 +298,18 @@ async def auth_and_fetch(email: str, otp_code: str | None = None) -> None:
             client_token = resp3.headers.get("Authorization", client_token)
             body = await resp3.json()
 
-        sessions = body.get("client", {}).get("sessions", [])
+        sessions = body.get("client", {}).get("sessions", []) or []
         if not sessions:
             print("No sessions after OTP — auth failed.")
             return
 
-        session_id = sessions[0]["id"]
+        # Clerk can list ended sessions alongside the live one.
+        active = next(
+            (s for s in sessions if s.get("status") == "active"), sessions[0]
+        )
+        session_id = active["id"]
         # Grab JWT directly from response if available (avoids extra /tokens call)
-        session_jwt = sessions[0].get("last_active_token", {}).get("jwt")
+        session_jwt = (active.get("last_active_token") or {}).get("jwt")
         print(f"Found session: {session_id}  jwt_in_response={bool(session_jwt)}")
 
         if not session_jwt:
@@ -364,7 +420,10 @@ async def auth_and_fetch(email: str, otp_code: str | None = None) -> None:
         await probe_endpoint(session, jwt, "MobileGetUsageCycles", loc_payload)
 
         # --- Broad API scan: find any endpoint whose response contains a target SSID ---
-        SCAN_TARGET = b"USGOV"  # raw bytes to search for in every response
+        if not scan_target:
+            print("\n(no ssid argument given — skipping the broad endpoint scan)")
+            return
+        SCAN_TARGET = scan_target.encode("utf-8")
         CANDIDATE_METHODS = [
             # Equipment / inventory
             "MobileGetSystemInfo",
@@ -419,6 +478,8 @@ async def auth_and_fetch(email: str, otp_code: str | None = None) -> None:
         print(f"{'#'*60}")
         hits = []
         for method in CANDIDATE_METHODS:
+            # Be a polite guest: this is 45 undocumented endpoints in a row.
+            await asyncio.sleep(0.5)
             url = f"{API_HOST}/{API_SERVICE}/{method}"
             headers = {
                 "Content-Type": "application/grpc-web+proto",
@@ -459,6 +520,10 @@ async def auth_and_fetch(email: str, otp_code: str | None = None) -> None:
 
 
 if __name__ == "__main__":
-    email = sys.argv[1] if len(sys.argv) > 1 else "user@example.com"
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    email = sys.argv[1]
     otp_code = sys.argv[2] if len(sys.argv) > 2 else None
-    asyncio.run(auth_and_fetch(email, otp_code))
+    scan_target = sys.argv[3] if len(sys.argv) > 3 else None
+    asyncio.run(auth_and_fetch(email, otp_code, scan_target))

@@ -5,10 +5,17 @@ from __future__ import annotations
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, CONF_SERVICE_LOCATION_ID, CONF_WIFI_SSID
+from .const import (
+    DOMAIN,
+    CONF_SERVICE_LOCATION_ID,
+    CONF_WIFI_SSID,
+    MANUFACTURER,
+    MODEL,
+)
 from .coordinator import BasePowerCoordinator
 
 _AUTO = "Auto (strongest signal)"
@@ -30,7 +37,8 @@ class BasePowerWifiSsidSelect(CoordinatorEntity[BasePowerCoordinator], SelectEnt
     _attr_has_entity_name = True
     _attr_name = "WiFi Network"
     _attr_icon = "mdi:wifi-settings"
-    _attr_entity_registry_enabled_default = True
+    # This only sets a preference, so it belongs in the device's config section.
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, coordinator: BasePowerCoordinator, entry: ConfigEntry) -> None:
         """Initialize."""
@@ -39,14 +47,14 @@ class BasePowerWifiSsidSelect(CoordinatorEntity[BasePowerCoordinator], SelectEnt
         self._attr_unique_id = f"{entry.data[CONF_SERVICE_LOCATION_ID]}_wifi_ssid_select"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.data[CONF_SERVICE_LOCATION_ID])},
-            "name": f"Base Power {entry.data[CONF_SERVICE_LOCATION_ID]}",
-            "manufacturer": "Base Power",
-            "model": "Home Battery System",
+            "name": f"{MANUFACTURER} {entry.data[CONF_SERVICE_LOCATION_ID]}",
+            "manufacturer": MANUFACTURER,
+            "model": MODEL,
         }
 
     def _scan(self) -> dict[str, int | None]:
         if self.coordinator.data:
-            return self.coordinator.data.get("wifi", {}).get("scan", {})
+            return self.coordinator.data.get("wifi", {}).get("scan") or {}
         return {}
 
     @property
