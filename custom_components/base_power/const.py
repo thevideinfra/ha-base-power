@@ -16,6 +16,10 @@ CLERK_JS_VERSION = "5"
 # Polling intervals (seconds)
 SCAN_INTERVAL_SECONDS = 300  # 5 minutes
 
+# Consecutive empty/failed GridStatus polls before its cached live values
+# (grid up/down, SoC, current) are dropped instead of served as current.
+GRID_STALE_POLLS = 3
+
 # Battery
 BATTERY_CAPACITY_PER_UNIT_KWH = 25  # Each Base Power battery is 25 kWh
 DEFAULT_BATTERY_COUNT = 1  # Fallback if API doesn't report count

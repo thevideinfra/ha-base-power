@@ -18,6 +18,8 @@ from homeassistant.util import dt as dt_util
 from .api import BasePowerApiClient
 from .auth import BasePowerAuth, AuthenticationError
 from .const import (
+    CONF_CLIENT_TOKEN,
+    GRID_STALE_POLLS,
     SCAN_INTERVAL_SECONDS,
     BATTERY_CAPACITY_PER_UNIT_KWH,
     DEFAULT_BATTERY_COUNT,
@@ -59,6 +61,7 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_charging: bool | None = None
         self._prev_soc_ts: int | None = None
         self._last_wifi_ssid: str | None = None
+        self._grid_misses: int = 0
 
         # FIX: last-known-good caches for the "optional" endpoints. Several of
         # these RPCs (GridStatus, UsageEnergy, UsageCycles, BillingMetadata)
@@ -85,6 +88,19 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_billing: dict[str, Any] = {"amount_cents": None, "due_date": None}
         self._last_cycles: dict[str, Any] = {"asset_id": None}
 
+    def _persist_client_token(self) -> None:
+        """Save the client token if Clerk rotated it.
+
+        Kept only in memory it would be lost on restart, leaving the config
+        entry holding a token Clerk may already have retired.
+        """
+        token = self.auth.client_token
+        if token and token != self._config_entry.data.get(CONF_CLIENT_TOKEN):
+            self.hass.config_entries.async_update_entry(
+                self._config_entry,
+                data={**self._config_entry.data, CONF_CLIENT_TOKEN: token},
+            )
+
     async def _fetch_optional(self, name: str, coro: Awaitable[_T]) -> _T | None:
         """Run a non-essential fetch, returning None if it fails.
 
@@ -107,6 +123,7 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Refresh JWT
             jwt = await self.auth.async_ensure_valid_token()
             self.api.set_jwt(jwt)
+            self._persist_client_token()
 
             # Fetch core data (required)
             dashboard = await self.api.get_dashboard_root(self.service_location_id)
@@ -121,7 +138,22 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             if fetched_grid and fetched_grid.get("available"):
                 self._last_grid = fetched_grid
+                self._grid_misses = 0
+            else:
+                self._grid_misses += 1
             grid = self._last_grid
+            if self._grid_misses > GRID_STALE_POLLS:
+                # Holding the cache through a blip is fine, but not forever:
+                # a stale "grid up" or SoC would hide a real outage. Drop the
+                # live values so sensors go unknown / fall back to estimates.
+                # Cumulative figures (daily totals, hourly usage) are kept.
+                grid = {
+                    **grid,
+                    "available": False,
+                    "battery_soc_percent": None,
+                    "current_power_amps": None,
+                    "soc_timestamp": None,
+                }
 
             fetched_wifi = await self._fetch_optional(
                 "WifiMetrics", self.api.get_wifi_metrics(self.service_location_id)

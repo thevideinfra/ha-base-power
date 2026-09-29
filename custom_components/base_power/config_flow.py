@@ -9,6 +9,7 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
     SelectSelector,
@@ -217,6 +218,10 @@ class BasePowerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             return await self.async_step_location(
                                 {CONF_SERVICE_LOCATION_ID: location_id}
                             )
+                    except AbortFlow:
+                        # e.g. already_configured -- a real result, not a
+                        # discovery failure; don't fall back to manual entry.
+                        raise
                     except Exception:
                         _LOGGER.warning(
                             "Location auto-discovery failed, falling back to manual entry",
@@ -224,6 +229,8 @@ class BasePowerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         )
 
                     return await self.async_step_location()
+            except AbortFlow:
+                raise
             except AuthenticationError:
                 errors["base"] = "invalid_code"
             except Exception:

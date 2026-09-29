@@ -108,6 +108,11 @@ class BasePowerAuth:
                 self._jwt_expires_at = exp - JWT_REFRESH_BUFFER
 
     @property
+    def client_token(self) -> str:
+        """Get current client token (may have been rotated by Clerk)."""
+        return self._client_token
+
+    @property
     def jwt(self) -> str | None:
         """Get current JWT."""
         return self._jwt
