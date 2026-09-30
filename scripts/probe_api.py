@@ -17,6 +17,10 @@ Probes:
   - MobileGetDashboardRoot       (with discovered service_location_id)
   - MobileGetGridStatus          (may have per-unit data)
   - MobileGetUsageCycles         (asset_id may encode unit info)
+  - MobileGetUsageEnergy / MobileGetRecentUsage / MobileGetBillingMetadata
+
+Every call also prints the HTTP status, grpc-status header and raw body, so an
+empty reply can be told apart from an error.
 
 Each response is fully dumped -- all fields recursively -- so we can spot
 where the battery unit count lives without guessing.
@@ -180,6 +184,12 @@ async def call_endpoint(
         async with session.post(url, headers=headers, data=build_grpc_frame(payload)) as resp:
             raw = await resp.read()
             grpc_status = resp.headers.get("grpc-status", "0")
+            # Always show the envelope: tells "empty reply" from "error", and a
+            # gRPC-Web trailer frame (0x80 flag) carries status in the body.
+            print(
+                f"  HTTP {resp.status}  grpc-status(header)={grpc_status!r}  "
+                f"body={len(raw)} bytes  raw={raw.hex()[:400]}"
+            )
             if grpc_status and grpc_status != "0":
                 print(f"  gRPC error: status={grpc_status} message={resp.headers.get('grpc-message','')}")
                 return None
@@ -418,6 +428,11 @@ async def auth_and_fetch(
         # --- Probe known-good endpoints ---
         await probe_endpoint(session, jwt, "MobileGetGridStatus", loc_payload)
         await probe_endpoint(session, jwt, "MobileGetUsageCycles", loc_payload)
+        # Endpoints the integration polls that were missing here; these back
+        # the sensors that read "Unknown".
+        await probe_endpoint(session, jwt, "MobileGetUsageEnergy", loc_payload)
+        await probe_endpoint(session, jwt, "MobileGetRecentUsage", loc_payload)
+        await probe_endpoint(session, jwt, "MobileGetBillingMetadata", loc_payload)
 
         # --- Broad API scan: find any endpoint whose response contains a target SSID ---
         if not scan_target:
